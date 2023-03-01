@@ -5,13 +5,25 @@ import java.net.SocketAddress;
 import java.net.SocketException;
 import java.util.Date;
 import java.text.SimpleDateFormat;
+import java.io.File;
+import java.nio.ByteBuffer;
+import java.io.InputStream;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.ByteArrayOutputStream;
+import java.nio.file.Files;
 
 public class App {
     private static final int TFTPORT = 4970;
-    private static final int BUFSIZE = 516;
+    private static final int PACKETSIZE = 516;
+    private static final int BUFSIZE = 512;
     private static final String READDIR = "/Users/ingmarfalk/uni/ComputerNetworks_1DV701/a3/read/";
     private static final String WRITEDIR = "/Users/ingmarfalk/uni/ComputerNetworks_1DV701/a3/write/";
-    private int blockNumber = 1;
+    // private int blockNumber = 1;
+    private static int clientTID;
+    private static int serverTID;
 
     public enum OpCode {
         Rrq,
@@ -57,40 +69,36 @@ public class App {
             System.exit(0);
         }
 
-        // checkTry("Failed to start Application", () -> {
-        // log("INFO", "Starting server...");
-        // App server = new App();
-        // server.start();
-        // });
-        try {
-            log("INFO", "Starting server...");
+        log("LINE", "Starting server...");
+        checkTry("Failed to start Application", () -> {
             App server = new App();
             server.start();
-        } catch (SocketException e) {
-            e.printStackTrace();
-        }
-
+        });
     }
 
     private void start() throws SocketException {
 
-        byte[] buf = new byte[BUFSIZE];
+        byte[] packetBuf = new byte[PACKETSIZE];
         DatagramSocket socket = new DatagramSocket(new InetSocketAddress(TFTPORT));
 
-        log("INFO", "Listening at port " + TFTPORT + " for new requests");
+        // log("INFO", "Listening at port " + TFTPORT + " for new requests");
+        log("LINE", "Listening at port " + TFTPORT + " for new requests.");
 
         while (true) {
 
-            InetSocketAddress clientAddress = receiveFrom(socket, buf);
+            InetSocketAddress clientAddress = receiveFrom(socket, packetBuf);
 
             if (clientAddress == null) {
                 continue;
             }
 
-            log("INFO", "Received request from " + clientAddress.getPort());
+            // log("INFO", "Received request from " + clientAddress.getPort());
+            log("LINE", "Received request from " + clientAddress.getPort());
             StringBuffer requestedFile = new StringBuffer();
-            int opCode = parseRequest(buf, requestedFile);
-            log("INFO", "Requested file: " + requestedFile.toString() + " :: opCode:  " + toOpCode(opCode));
+            int opCode = parseRequest(packetBuf, requestedFile);
+            // log("INFO", "Requested file: " + requestedFile.toString() + " :: opCode: " +
+            // toOpCode(opCode));
+            log("LINE", "Requested file: " + requestedFile.toString() + " :: opCode:  " + toOpCode(opCode));
 
             new Thread() {
                 public void run() {
@@ -100,6 +108,8 @@ public class App {
                     checkTry(
                             "Failed connecting to socket.",
                             () -> sendSocket.connect(clientAddress));
+                    clientTID = socket.getPort();
+                    serverTID = socket.getLocalPort();
 
                     if (sendSocket == null) {
                         return;
@@ -113,9 +123,9 @@ public class App {
 
     }
 
-    private InetSocketAddress receiveFrom(DatagramSocket socket, byte[] buf) {
+    private InetSocketAddress receiveFrom(DatagramSocket socket, byte[] packetBuf) {
 
-        DatagramPacket packet = new DatagramPacket(buf, buf.length);
+        DatagramPacket packet = new DatagramPacket(packetBuf, packetBuf.length);
         checkTry("Error receiving packet.", () -> socket.receive(packet));
         return (InetSocketAddress) packet.getSocketAddress();
 
@@ -148,28 +158,79 @@ public class App {
         switch (op) {
             case Rrq -> sendDataReceiveAck(READDIR + requestedFile, socket);
             case Wrq -> receiveAckSendData(WRITEDIR + requestedFile);
-            default -> sendError(socket, 4, "Illegal TFTP operation.");
+            default -> sendError(socket, Error.IllegalTFTPOperation);
         }
 
     }
 
     private boolean sendDataReceiveAck(String requestedFile, DatagramSocket socket) {
 
-        log("INFO", "Sending data.");
-
-        byte[] packet = new byte[BUFSIZE];
-
-        setMetaData(packet, 3, blockNumber);
-
-        byte[] dataBuf = new byte[512];
+        log("LINE", "Sending data.");
 
         File file = new File(requestedFile);
+        int block = 1;
+
+        log("LINE", requestedFile);
 
         if (!file.exists()) {
-            sendError(socket, 1, "File not found.");
+            sendError(socket, Error.FileNotFound);
             return false;
         }
 
+        // byte[] fileBytes = new byte[(int) file.length()];
+        FileInputStream fis = checkTry(file.getName() + " not found.", () -> new FileInputStream(file));
+
+        while (true) {
+            byte[] buf = new byte[BUFSIZE];
+            int bytesRead = checkTry("Error reading bytes from file", () -> fis.read(buf));
+            byte[] data = setBytes(buf, 3, block);
+
+            int sendCnt = 0;
+
+            checkTry("Could not set socket timeout.", () -> socket.setSoTimeout(5000));
+
+            send: while (sendCnt < 5) {
+                sendCnt++;
+                DatagramPacket packet = new DatagramPacket(data, bytesRead + 4);
+                checkTry("Error sending packet.", () -> socket.send(packet));
+
+                ByteBuffer ack = ByteBuffer.allocate(4);
+                byte[] ackBytes = ack.array();
+                DatagramPacket ackPacket = new DatagramPacket(ackBytes, ackBytes.length);
+                checkTry("Error receiving acknowledgement packet from socket.", () -> socket.receive(ackPacket));
+
+                OpCode opCode = toOpCode(ack.getShort());
+                short blockOrError = ack.getShort();
+
+                if (opCode == OpCode.Ack && blockOrError == block) {
+                    break send;
+                }
+
+                if (opCode == OpCode.Err) {
+                    Error error = Error.values()[blockOrError - 1];
+                    sendError(socket, error);
+                    return false;
+                }
+
+                if (clientTID != socket.getPort() && serverTID != socket.getLocalPort()) {
+                    sendError(socket, Error.UnknownTID);
+                    return false;
+                }
+            }
+
+            if (sendCnt >= 5) {
+                sendError(socket, Error.UnknownTID);
+                return false;
+            }
+
+            if (bytesRead < BUFSIZE) {
+                break;
+            }
+
+            block++;
+        }
+
+        checkTry("Error closing file input stream.", () -> fis.close());
         return true;
     }
 
@@ -178,32 +239,27 @@ public class App {
         return true;
     }
 
-    private void sendError(DatagramSocket socket, int errCode, Error error) {
+    private void sendError(DatagramSocket socket, Error error) {
 
-        byte[] packet = new byte[BUFSIZE];
-        byte[] buf = error.getMsg().getBytes();
-
-        setMetaData(packet, 5, errCode);
-
-        for (int i = 0; i < buf.length; i++) {
-            packet[i + 4] = buf[i];
-        }
-
+        byte[] packet = setBytes(error.getMsg().getBytes(), 5, error.ordinal());
         checkTry("Error sending error reponse.", () -> socket.send(new DatagramPacket(packet, packet.length)));
-
         log("ERROR", error.getMsg());
     }
 
-    private void setMetaData(byte[] packet, int opCode, int data) {
+    private ByteBuffer setBytes(int size, int opCode, int info) {
+        ByteBuffer bb = ByteBuffer.allocate(size);
+        bb.putShort((short) opCode);
+        bb.putShort((short) info);
 
-        packet[0] = 0;
-        packet[1] = (byte) opCode;
+        return bb;
+    }
 
-        byte[] dataBytes = ByteBuffer.allocate(2).putShort((short) data).array();
-
-        packet[2] = dataBytes[0];
-        packet[3] = dataBytes[1];
-
+    private byte[] setBytes(byte[] bytes, int opCode, int info) {
+        ByteBuffer bb = ByteBuffer.allocate(bytes.length + 4);
+        bb.putShort((short) opCode);
+        bb.putShort((short) info);
+        bb.put(bytes);
+        return bb.array();
     }
 
     private static void log(String level, String msg) {
@@ -219,9 +275,21 @@ public class App {
             case "SUCCESS" -> System.out.println(date + " :: " + success + " :: " + msg);
             case "WARNING" -> System.out.println(date + " :: " + warning + " :: " + msg);
             case "INFO" -> System.out.println(date + " :: " + info + " :: " + msg);
+            case "LINE" -> {
+                int lineNumber = Thread.currentThread().getStackTrace()[2].getLineNumber();
+                System.out.println(date + " :: " + lineNumber + " :: " + msg);
+            }
             default -> System.out.println(date + " :: " + msg);
         }
+    }
 
+    private static void logMsg(String errMsg) {
+        String fullClassName = Thread.currentThread().getStackTrace()[2].getClassName();
+        String className = fullClassName.substring(fullClassName.lastIndexOf(".") + 1);
+        String methodName = Thread.currentThread().getStackTrace()[2].getMethodName();
+        int lineNumber = Thread.currentThread().getStackTrace()[2].getLineNumber();
+
+        System.out.println(className + "." + methodName + "():" + lineNumber + "\t:: " + errMsg);
     }
 
     private OpCode toOpCode(int opCode) {
@@ -231,17 +299,39 @@ public class App {
         return OpCode.values()[opCode - 1];
     }
 
-    private void checkTry(String errMsg, VoidThrow fn) {
+    private static void checkTry(String errMsg, VoidThrow fn) {
         try {
             fn.run();
+        } catch (SocketException e) {
+            log("ERROR", "SocketException :: " + errMsg);
+        } catch (IOException e) {
+            log("ERROR", "IOException :: " + errMsg);
         } catch (Exception e) {
             log("ERROR", errMsg);
         }
     }
 
-    private <T> T checkTry(String errMsg, Throwable<T> fn) {
+    private static <T> T checkTry(String errMsg, Throwable<T> fn) {
         try {
             return fn.run();
+        } catch (SocketException e) {
+            log("ERROR", "SocketException :: " + errMsg);
+        } catch (IOException e) {
+            log("ERROR", "IOException :: " + errMsg);
+        } catch (Exception e) {
+            log("ERROR", errMsg);
+        }
+        return null;
+    }
+
+    private <T> T checkTry(DatagramSocket socket, String errMsg, Throwable<T> fn) {
+        try {
+            return fn.run();
+        } catch (SocketException e) {
+            log("ERROR", "SocketException :: " + errMsg);
+        } catch (IOException e) {
+            sendError(socket, Error.FileNotFound);
+            log("ERROR", "IOException :: " + errMsg);
         } catch (Exception e) {
             log("ERROR", errMsg);
         }
