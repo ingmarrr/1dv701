@@ -3,6 +3,7 @@ import java.net.DatagramPacket;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.SocketException;
+import java.util.Arrays;
 import java.util.Date;
 import java.text.SimpleDateFormat;
 import java.io.File;
@@ -11,6 +12,7 @@ import java.io.InputStream;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.FileNotFoundException;
 import java.io.ByteArrayOutputStream;
 import java.nio.file.Files;
@@ -45,7 +47,7 @@ public class App {
         Undefined("Undefined error code."),
         FileNotFound("File not found."),
         AccessViolation("Access violation."),
-        LostAccess("Disk full or allocation exceeded."),
+        MissingSpace("Disk full or allocation exceeded."),
         IllegalTFTPOperation("Illegal TFTP operation."),
         UnknownTID("Unknown transfer ID."),
         FileAlreadyExists("File already exists."),
@@ -157,7 +159,7 @@ public class App {
 
         switch (op) {
             case Rrq -> sendDataReceiveAck(READDIR + requestedFile, socket);
-            case Wrq -> receiveAckSendData(WRITEDIR + requestedFile);
+            case Wrq -> receiveDataSendAck(WRITEDIR + requestedFile, socket);
             default -> sendError(socket, Error.IllegalTFTPOperation);
         }
 
@@ -177,12 +179,11 @@ public class App {
             return false;
         }
 
-        // byte[] fileBytes = new byte[(int) file.length()];
         FileInputStream fis = checkTry(file.getName() + " not found.", () -> new FileInputStream(file));
 
         while (true) {
             byte[] buf = new byte[BUFSIZE];
-            int bytesRead = checkTry("Error reading bytes from file", () -> fis.read(buf));
+            int bytesRead = checkIOTry(socket, Error.AccessViolation, () -> fis.read(buf));
             byte[] data = setBytes(buf, 3, block);
 
             int sendCnt = 0;
@@ -193,11 +194,13 @@ public class App {
                 sendCnt++;
                 DatagramPacket packet = new DatagramPacket(data, bytesRead + 4);
                 checkTry("Error sending packet.", () -> socket.send(packet));
+                log("SUCCESS", "Sent block (" + block + ")");
 
                 ByteBuffer ack = ByteBuffer.allocate(4);
                 byte[] ackBytes = ack.array();
                 DatagramPacket ackPacket = new DatagramPacket(ackBytes, ackBytes.length);
                 checkTry("Error receiving acknowledgement packet from socket.", () -> socket.receive(ackPacket));
+                log("SUCCESS", "Received acknowledgement packet.");
 
                 OpCode opCode = toOpCode(ack.getShort());
                 short blockOrError = ack.getShort();
@@ -230,11 +233,78 @@ public class App {
             block++;
         }
 
+        log("SUCCESS", "Sent file.");
         checkTry("Error closing file input stream.", () -> fis.close());
         return true;
     }
 
-    private boolean receiveAckSendData(String unknownParams) {
+    private boolean receiveDataSendAck(String requestedFile, DatagramSocket socket) {
+
+        log("LINE", "Receiving data.");
+
+        File file = new File(requestedFile);
+        int block = 0;
+
+        if (file.exists()) {
+            sendError(socket, Error.FileAlreadyExists);
+            return false;
+        }
+
+        FileOutputStream out = checkIOTry(socket, Error.AccessViolation, () -> new FileOutputStream(requestedFile));
+        ByteBuffer ack = setBytes(4, 4, block);
+        byte[] ackBytes = ack.array();
+        DatagramPacket ackPacket = new DatagramPacket(ackBytes, ackBytes.length);
+        checkTry("Error sending acknowledgement packet.", () -> socket.send(ackPacket));
+
+        receiveLoop: while (true) {
+            checkTry("Could not set socket timeout.", () -> socket.setSoTimeout(5000));
+
+            byte[] buf = new byte[PACKETSIZE];
+            DatagramPacket packet = new DatagramPacket(buf, buf.length);
+            checkTry("Error receiving packet from socket.", () -> socket.receive(packet));
+            log("SUCCESS", "Received data packet.");
+
+            ByteBuffer wrapped = ByteBuffer.wrap(packet.getData());
+            OpCode opCode = toOpCode(wrapped.getShort());
+
+            switch (opCode) {
+                case Data -> {
+                    byte[] data = Arrays.copyOfRange(packet.getData(), 4, packet.getLength());
+                    long freeSpace = new File(WRITEDIR).getUsableSpace();
+                    if (data.length > freeSpace) {
+                        sendError(socket, Error.MissingSpace);
+                        return false;
+                    }
+                    checkTry("Error writing received data to file.", () -> {
+                        out.write(data);
+                        out.flush();
+                        log("SUCCESS", "Wrote " + requestedFile + " into " + WRITEDIR);
+                    });
+
+                    ByteBuffer ackData = setBytes(4, 4, wrapped.getShort());
+                    byte[] ackDataBytes = ackData.array();
+                    DatagramPacket ackDataPacket = new DatagramPacket(ackDataBytes, ackDataBytes.length);
+                    checkTry("Error sending acknowledgement packet to socket.", () -> socket.send(ackDataPacket));
+                    log("SUCCESS", "Sent acknowledgement packet.");
+
+                    if (data.length < BUFSIZE) {
+                        socket.close();
+                        checkTry("Error closing file output stream.", () -> out.close());
+                        log("LINE", "Closed socket and output stream.");
+                        break receiveLoop;
+                    }
+                }
+                case Err -> {
+                    Error error = Error.values()[wrapped.getShort()];
+                    sendError(socket, error);
+                    return false;
+                }
+                default -> {
+                    sendError(socket, Error.IllegalTFTPOperation);
+                    return false;
+                }
+            }
+        }
 
         return true;
     }
@@ -324,16 +394,14 @@ public class App {
         return null;
     }
 
-    private <T> T checkTry(DatagramSocket socket, String errMsg, Throwable<T> fn) {
+    private <T> T checkIOTry(DatagramSocket socket, Error error, Throwable<T> fn) {
         try {
             return fn.run();
-        } catch (SocketException e) {
-            log("ERROR", "SocketException :: " + errMsg);
         } catch (IOException e) {
             sendError(socket, Error.FileNotFound);
-            log("ERROR", "IOException :: " + errMsg);
+            log("ERROR", "IOException :: " + error.getMsg());
         } catch (Exception e) {
-            log("ERROR", errMsg);
+            log("ERROR", error.getMsg());
         }
         return null;
     }
